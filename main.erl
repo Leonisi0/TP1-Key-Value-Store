@@ -9,41 +9,38 @@
 
 start_link(N) when N >= 0 -> 
     case N of
-        0 -> return []
-        _ -> pid = spawn(simple_kv, loop, #{})    
-        return start_link(N-1) ++ [pid]
-    end
+        0 -> [];
+        _ ->
+            Pid = spawn(simple_kv, loop, #{}),    
+            start_link(N-1) ++ [Pid]
+    end.
     
 loop(State) -> 
     receive 
         {put, Key, Value, SenderPid} -> 
-            NewState = State#{Key => Value}
-            SenderPid ! ok
-            loop(NewState)
+            NewState = State#{Key => Value},
+            SenderPid ! ok,
+            loop(NewState);
         {get, Key, SenderPid} ->
             case maps:find(Key, State) of
-                {ok, Value} -> SenderPid ! {ok, Value}
-                error -> 
-                    
-            loop(State)
+                {ok, Value} -> SenderPid ! {ok, Value};
+                error -> {error, not_found}
+            end,
+            loop(State);
         {delete, Key, SenderPid} -> 
-            NewState = maps:remove(Key, State)
-            SenderPid ! ok
-            loop(NewState)
-        stop -> 
-            SenderPid ! ok
-            loop(State)
-    end
-    
+            NewState = maps:remove(Key, State),
+            SenderPid ! ok,
+            loop(NewState);
+        {stop, SenderPid} -> 
+            SenderPid ! ok,
+    end.
 
+put(Pid, Key, Value) -> 
+    Pid ! {put, Key, Value, self()}.
 
+get(Pid, Key) -> 
+    Pid ! {get, Key, self()}.
 
-put(pid, key, Value) -> 
-    pid ! {put, key, Value}
-
-get(pid, key) -> 
-    pid ! {get, key}
-
-delete(pid, key) -> 
-    pid ! {delete, key}
+delete(Pid, Key) -> 
+    Pid ! {delete, Key, self()}.
 
