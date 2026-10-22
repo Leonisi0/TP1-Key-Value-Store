@@ -8,29 +8,49 @@
 -spec get(pid(), term()) -> {ok, term()} | not_found.
 
 start_link(N) when N >= 0 -> 
+    star_superLink(N,true)
+
+star_superLink(N,Primero) when N >= 0 -> 
     case N of
         0 -> [];
         _ ->
-            Pid = spawn(simple_kv, loop, #{}),    
-            start_link(N-1) ++ [Pid]
+            Pid = spawn(fun init/0),    
+            Lista = start_superLink(N-1, Primero) ++ [Pid]
+    end.
+    case Primero of 
+        true -> todosConTodos(Lista, length(Lista))
+
+todosConTodos(ListaPids, ListaEnviar) ->
+    case ListaEnviar of 
+        [] -> ok;
+        _ -> 
+            [Head | Tail ] = ListaEnviar,
+            Head ! ListaPids,
+            todosConTodos(ListaPids, Tail)
     end.
     
-loop(State) -> 
+init() ->
+    receive 
+        {configure, Pids} ->
+            loop(#{}, Pids)
+    end.
+    
+loop(State, Lista) -> 
     receive 
         {put, Key, Value, SenderPid} -> 
             NewState = State#{Key => Value},
             SenderPid ! ok,
-            loop(NewState);
+            loop(NewState, Lista);
         {get, Key, SenderPid} ->
             case maps:find(Key, State) of
                 {ok, Value} -> SenderPid ! {ok, Value};
                 error -> {error, not_found}
             end,
-            loop(State);
+            loop(State, Lista);
         {delete, Key, SenderPid} -> 
             NewState = maps:remove(Key, State),
             SenderPid ! ok,
-            loop(NewState);
+            loop(NewState, Lista);
         {stop, SenderPid} -> 
             SenderPid ! ok,
     end.
