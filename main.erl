@@ -15,10 +15,10 @@ star_superLink(N,Primero) when N >= 0 ->
         0 -> [];
         _ ->
             Pid = spawn(fun init/0),    
-            Lista = start_superLink(N-1, Primero) ++ [Pid]
+            ListaPids = start_superLink(N-1, Primero) ++ [Pid]
     end.
     case Primero of 
-        true -> todosConTodos(Lista, length(Lista))
+        true -> todosConTodos(ListaPids, length(ListaPids))
 
 todosConTodos(ListaPids, ListaEnviar) ->
     case ListaEnviar of 
@@ -35,22 +35,22 @@ init() ->
             loop(#{}, Pids)
     end.
     
-loop(State, Lista) -> 
+loop(State, ListaPids) -> 
     receive 
         {put, Key, Value, SenderPid} -> 
-            NewState = State#{Key => Value},
+            NewState = put_in_replicas(),
             SenderPid ! ok,
-            loop(NewState, Lista);
+            loop(NewState, ListaPids);
         {get, Key, SenderPid} ->
             case maps:find(Key, State) of
                 {ok, Value} -> SenderPid ! {ok, Value};
                 error -> {error, not_found}
             end,
-            loop(State, Lista);
+            loop(State, ListaPids);
         {delete, Key, SenderPid} -> 
             NewState = maps:remove(Key, State),
             SenderPid ! ok,
-            loop(NewState, Lista);
+            loop(NewState, ListaPids);
         {stop, SenderPid} -> 
             SenderPid ! ok,
     end.
@@ -64,3 +64,22 @@ get(Pid, Key) ->
 delete(Pid, Key) -> 
     Pid ! {delete, Key, self()}.
 
+put_in_replicas(State, Key, Value, TTL, ListaPids) ->
+    CreatedAt = erlang:system_time(miliseconds)
+    Entry = {Key => {Value, TTL, CreatedAt}} %FIX ME: habria que ver como mandarlo para que funcione con el pattern matching
+    State#Entry %FIXME: vale esto?
+    send_to_replicas(ListaPids, Entry, MyPid)
+    
+send_to_replcias(ToSend, Entry, MyPid) ->
+    case ToSend of 
+        [] -> ok;
+        _ -> 
+            [Head | Tail ] = ToSend,
+            if 
+                Head == MyPid -> 
+                    ,todosConTodos(Tail, Entry, MyPid)
+                true ->
+                    Head ! Entry
+                    todosConTodos(Tail, Entry, MyPid)
+    end.
+    
