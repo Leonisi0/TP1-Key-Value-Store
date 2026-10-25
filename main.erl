@@ -38,7 +38,7 @@ init() ->
 loop(State, ListaPids) -> 
     receive 
         {put, Key, Value, SenderPid} -> 
-            NewState = put_in_replicas(),
+            NewState = put_in_replicas(), 
             SenderPid ! ok,
             loop(NewState, ListaPids);
         {get, Key, SenderPid} ->
