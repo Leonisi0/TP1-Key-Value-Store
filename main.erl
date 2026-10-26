@@ -16,9 +16,9 @@ star_superLink(N,Primero) when N >= 0 ->
         _ ->
             Pid = spawn(fun init/0),    
             ListaPids = start_superLink(N-1, Primero) ++ [Pid]
-    end.
+    end
     case Primero of 
-        true -> todosConTodos(ListaPids, length(ListaPids))
+        true -> todosConTodos(ListaPids, length(ListaPids)).
 
 todosConTodos(ListaPids, ListaEnviar) ->
     case ListaEnviar of 
@@ -37,10 +37,13 @@ init() ->
     
 loop(State, ListaPids) -> 
     receive 
-        {put, Key, Value, SenderPid} -> 
-            NewState = put_in_replicas(), 
-            SenderPid ! ok,
+        {put, Key, Value, TTL, SenderPid, ReferenceForSender} -> 
+            NewState = put_handler(State, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids), 
             loop(NewState, ListaPids);
+        {spread_put, Key, Value, TTL, Timestamp} ->
+            NewState = spread_put_handler(State, Key, Value, TTL, Timestamp),
+            loop(NewState, ListaPids);
+
         {get, Key, SenderPid} ->
             case maps:find(Key, State) of
                 {ok, Value} -> SenderPid ! {ok, Value};
@@ -52,11 +55,15 @@ loop(State, ListaPids) ->
             SenderPid ! ok,
             loop(NewState, ListaPids);
         {stop, SenderPid} -> 
-            SenderPid ! ok,
+            SenderPid ! ok
     end.
 
 put(Pid, Key, Value) -> 
-    Pid ! {put, Key, Value, self()}.
+    Ref = make_ref(), %para identificar cuando me responda quien me respondio ok
+    Pid ! {put, Key, Value, self(), Ref},
+    receive 
+        {ok, Ref} -> ok %ok
+    end.
 
 get(Pid, Key) -> 
     Pid ! {get, Key, self()}.
@@ -64,22 +71,56 @@ get(Pid, Key) ->
 delete(Pid, Key) -> 
     Pid ! {delete, Key, self()}.
 
-put_in_replicas(State, Key, Value, TTL, ListaPids) ->
-    CreatedAt = erlang:system_time(miliseconds)
-    Entry = {Key => {Value, TTL, CreatedAt}} %FIX ME: habria que ver como mandarlo para que funcione con el pattern matching
-    State#Entry %FIXME: vale esto?
-    send_to_replicas(ListaPids, Entry, MyPid)
-    
-send_to_replcias(ToSend, Entry, MyPid) ->
+
+send_to_replicas(ToSend, Message, MyPid) ->
     case ToSend of 
         [] -> ok;
         _ -> 
             [Head | Tail ] = ToSend,
             if 
                 Head == MyPid -> 
-                    ,todosConTodos(Tail, Entry, MyPid)
+                    send_to_replicas(Tail, Message, MyPid);
                 true ->
-                    Head ! Entry
-                    todosConTodos(Tail, Entry, MyPid)
+                    Head ! Message,
+                    send_to_replicas(Tail, Message, MyPid)
+            end
     end.
     
+
+%%%%%%%%%% HANDLERS %%%%%%%%%%
+
+put_handler(State, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids) ->
+    Timestamp = erlang:system_time(millisecond), %generamos el timestamp
+    NewState = State#{Key => {Value, TTL, Timestamp}}, %guardamos la key en el nuevo estado
+    SenderPid ! {ok, ReferenceForSender},
+    Message = {spread_put, Key, Value, TTL, Timestamp}, %armamos el mensaje a enviar         
+    send_to_replicas(ListaPids, Message, self()), %paso la lista de pids a enviar, la entry y me envio a mi
+    NewState. %retorno el nuevo estado
+
+spread_put_handler(State, Key, Value, TTL, Timestamp) ->
+    case maps:find(Key, State) of
+        {ok, {_, _, MyTimestamp}} -> %existe esa key en mis libros, reviso cual es mas nueva
+            CurrentTime = erlang:system_time(millisecond),
+            IsNewer = if %si ttl es infinity rompe la suma con ttl hay que separarlo
+                TTL =:= infinity ->
+                    MyTimestamp < Timestamp;
+                true ->
+                    (MyTimestamp < Timestamp) andalso ((Timestamp + TTL) > CurrentTime)
+            end,
+            if 
+                IsNewer =:= true ->
+                    State#{Key => {Value, TTL, Timestamp}};
+                true ->
+                    State
+            end;
+        error -> %no tengo esa key, veo que efectivamente no este expirado
+            CurrentTime = erlang:system_time(millisecond),
+            IsExpired = (TTL =/= infinity) andalso ((Timestamp + TTL) =< CurrentTime),
+            if 
+                IsExpired =:= false ->
+                    State#{Key => {Value, TTL, Timestamp}};
+                true ->
+                    State
+            end
+    end.
+
