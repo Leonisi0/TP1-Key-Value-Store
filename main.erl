@@ -37,18 +37,15 @@ init() ->
     
 loop(State, ListaPids) -> 
     receive 
-        {put, Key, Value, TTL, SenderPid, ReferenceForSender} -> 
+        {put, Key, Value, TTL, SenderPid, ReferenceForSender} -> %FIXME: estamos devolviendo ok al que solicito?
             NewState = put_handler(State, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids), 
             loop(NewState, ListaPids);
-        {spread_put, Key, Value, TTL, Timestamp} ->
+        {spread_put, Key, Value, TTL, Timestamp} -> %FIXME: estamos devolviendo ok al que solicito?
             NewState = spread_put_handler(State, Key, Value, TTL, Timestamp),
             loop(NewState, ListaPids);
 
-        {get, Key, SenderPid} ->
-            case maps:find(Key, State) of
-                {ok, Value} -> SenderPid ! {ok, Value};
-                error -> {error, not_found}
-            end,
+        {get, Key, SenderPid, ReferenceForSender} ->
+            get_handler(State, Key, SenderPid, ReferenceForSender)
             loop(State, ListaPids);
         {delete, Key, SenderPid} -> 
             NewState = maps:remove(Key, State),
@@ -86,8 +83,21 @@ send_to_replicas(ToSend, Message, MyPid) ->
             end
     end.
     
-
 %%%%%%%%%% HANDLERS %%%%%%%%%%
+
+get_handler(State, Key, SenderPid, ReferenceForSender) ->
+    case maps:find(Key, State) of
+        {ok, {Value, TTL, Timestamp}} ->
+            CurrentTime = erlang:system_time(millisecond),
+            IsExpired = (TTL =/= infinity) andalso ((Timestamp + TTL) =< CurrentTime),
+            if 
+                IsExpired ->
+                    %hago spawn y busco
+                true ->
+                    SenderPid ! {ok, Value, ReferenceForSender} 
+            end;
+        error ->
+            %aca deberia tambien hacer spawn y buscar, deberia extraer el metodo
 
 put_handler(State, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids) ->
     Timestamp = erlang:system_time(millisecond), %generamos el timestamp
