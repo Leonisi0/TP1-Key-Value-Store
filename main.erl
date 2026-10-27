@@ -44,11 +44,11 @@ loop(State, ListaPids) ->
             NewState = spread_put_handler(State, Key, Value, TTL, Timestamp),
             loop(NewState, ListaPids);
 
-        {get, Key, SenderPid, ReferenceForSender} -> %FIXME IMPORTANTE: el get deberia devolver si tiene una local unexpired o ver cual es la mas nueva??? 
-            get_handler(State, Key, SenderPid, ReferenceForSender)
+        {get, Key, SenderPid, ReferenceForSender} ->  
+            get_handler(State, ListaPids, Key, SenderPid, ReferenceForSender),
             loop(State, ListaPids);
         {spread_get, Key, SenderPid, ReferenceForSender} ->
-            spread_get_handler() %FIXME: PONER LOS ARGUMENTOS
+            spread_get_handler(State, Key, SenderPid, ReferenceForSender),
             loop(State, ListaPids)
          
         {delete, Key, SenderPid} -> 
@@ -59,6 +59,8 @@ loop(State, ListaPids) ->
             SenderPid ! ok
     end.
 
+%%%%%%%%%% LLAMADOS %%%%%%%%%%%
+
 put(Pid, Key, Value) -> 
     Ref = make_ref(), %para identificar cuando me responda quien me respondio ok
     Pid ! {put, Key, Value, self(), Ref},
@@ -67,11 +69,17 @@ put(Pid, Key, Value) ->
     end.
 
 get(Pid, Key) -> 
-    Pid ! {get, Key, self()}.
+    Ref = make_ref(),
+    Pid ! {get, Key, self(), Ref},         
+    receive
+        {Ref, Response} ->
+            Response
+    end.                                   
 
 delete(Pid, Key) -> 
     Pid ! {delete, Key, self()}.
 
+%%%%%%%%%% FUNCIONES AUXILIARES %%%%%%%%%%
 
 send_to_replicas(ToSend, Message, MyPid) ->
     case ToSend of 
@@ -86,7 +94,62 @@ send_to_replicas(ToSend, Message, MyPid) ->
                     send_to_replicas(Tail, Message, MyPid)
             end
     end.
-    
+
+fork_and_seek(ToSend, Key, SenderPid, ReferenceForSender) -> %hay que ver que argumentos me paso
+    Ref = make_ref(),
+    MyPid = self(), %guardamos nuestro pid antes del fork para que no mire su pid sino el del padre (nosotros)
+    spawn(fun() ->
+        Message = {spread_get, Key, self(), Ref}, %aca adentro le pasamos nuestro pid osea el del fork
+        send_to_replicas(ToSend, Message, MyPid), %con esta me pongo a preguntarle a todos, no se si puedo usar esta
+        get_newest_value_or_nothing((length(ToSend)-1), none, SenderPid, Ref, ReferenceForSender) %OJO, none es un atomo y comparar integers contra atomos devuelve que el atomo es mayor, cuidado con esto
+    end).
+
+get_newest_value_or_nothing(Iterator, NewestValue, SenderPid, MyRef, ReferenceForSender) ->
+    case Iterator of
+        0 ->
+            case NewestValue of
+                none ->
+                    SenderPid ! {ReferenceForSender, not_found};
+                {Value, _, _} ->
+                    SenderPid ! {ReferenceForSender, {ok, Value}}
+            end;
+        _ ->
+            receive 
+                {MyRef, Value, TTL, Timestamp} ->
+                    UpdatedValue = newest_unexpired_between(NewestValue, Value, TTL, Timestamp),
+                    get_newest_value_or_nothing(Iterator-1, UpdatedValue, SenderPid, MyRef, ReferenceForSender);
+                {MyRef, not_found} ->
+                    get_newest_value_or_nothing(Iterator-1, NewestValue, SenderPid, MyRef, ReferenceForSender)
+            end
+    end.
+
+newest_unexpired_between(NewestValue, Value, TTL, Timestamp) ->
+    case NewestValue of 
+        none ->
+            CurrentTime = erlang:system_time(millisecond),
+            IsExpired = (TTL =/= infinity) andalso ((Timestamp + TTL) =< CurrentTime),
+            if 
+                IsExpired ->
+                    none;
+                true -> 
+                    {Value, TTL, Timestamp}
+            end;
+        {_, _, NewestTimestamp} ->
+            CurrentTime = erlang:system_time(millisecond),
+            IsExpired = (TTL =/= infinity) andalso ((Timestamp + TTL) =< CurrentTime),
+            if 
+                IsExpired ->
+                    NewestValue;
+                true ->
+                    if 
+                        NewestTimestamp >= Timestamp ->
+                            NewestValue;
+                        true ->
+                            {Value, TTL, Timestamp}
+                    end
+            end
+    end.
+            
 %%%%%%%%%% HANDLERS %%%%%%%%%%
 
 get_handler(State, ListaPids, Key, SenderPid, ReferenceForSender) ->
@@ -96,39 +159,28 @@ get_handler(State, ListaPids, Key, SenderPid, ReferenceForSender) ->
             IsExpired = (TTL =/= infinity) andalso ((Timestamp + TTL) =< CurrentTime),
             if 
                 IsExpired ->
-                    fork_and_seek();
+                    fork_and_seek(ListaPids, Key, SenderPid, ReferenceForSender);
                 true ->
-                    SenderPid ! {ReferenceForSender, ok, Value} 
+                    SenderPid ! {ReferenceForSender, {ok, Value}} 
             end;
         error ->
-            fork_and_seek()
+            fork_and_seek(ListaPids, Key, SenderPid, ReferenceForSender)
     end.
 
-fork_and_seek(ToSend, Key, SenderPid) -> %hay que ver que argumentos me paso
-    Ref = make_ref(),
-    MyPid = self(), %guardamos nuestro pid antes del fork para que no mire su pid sino el del padre (nosotros)
-    spawn(fun() ->
-        Message = {spread_get, Key, self(), Ref}, %aca adentro le pasamos nuestro pid osea el del fork
-        send_to_replicas(ToSend, Message, MyPid), %con esta me pongo a preguntarle a todos, no se si puedo usar esta
-        xxx((length(ToSend)-1), none, SenderPid) %OJO, none es un atomo y comparar integers contra atomos devuelve que el atomo es mayor, cuidado con esto
-    end).
-
-xxx(Iterator, NewestValue, SenderPid) ->
-    case Iterator of
-        0 ->
-            if NewestValue =:= none -> 
-        _ ->
+spread_get_handler(State, Key, SenderPid, ReferenceForSender) ->
+    case maps:find(Key, State) of 
+        {ok, {Value, TTL, Timestamp}} ->
+            CurrentTime = erlang:system_time(millisecond),
+            IsExpired = (TTL =/= infinity) andalso ((Timestamp + TTL) =< CurrentTime),
+            if 
+                IsExpired -> 
+                    SenderPid ! {ReferenceForSender, not_found};
+                true ->
+                    SenderPid ! {ReferenceForSender, Value, TTL, Timestamp}
+            end;
+        error ->
+            SenderPid ! {ReferenceForSender, not_found}
     end.
-
-    receive
-        {ReferenceForSender, Value, TTL, Timestamp} ->
-            NewestValue = newest_unexpired_between(NewestValue, Value, TTL, Timestamp)
-        {ReferenceForSender, not_found} ->
-        
-        xxx(Iterator-1, NewestValue, SenderPid)
-    end.
-
-
 
 put_handler(State, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids) ->
     Timestamp = erlang:system_time(millisecond), %generamos el timestamp
