@@ -75,12 +75,14 @@ loop(State, ListaPids, Alpha) ->
 %%%%%%%%%% LLAMADOS %%%%%%%%%%%
 
 put(Pid, Key, Value) -> 
-    Ref = make_ref(), %para identificar cuando me responda quien me respondio ok
-    Pid ! {put, Key, Value, self(), Ref},
+    put(Pid, Key, Value, infinity).
+
+put(Pid, Key, Value, TTL) -> 
+    Ref = make_ref(),
+    Pid ! {put, Key, Value, TTL, self(), Ref},
     receive 
         {ok, Ref} -> ok %ok
     end.
-
 get(Pid, Key) -> 
     Ref = make_ref(),
     Pid ! {get, Key, self(), Ref},         
@@ -184,16 +186,16 @@ newest_unexpired_between(NewestValue, Value, TTL, Timestamp) ->
 
 is_this_an_offer_i_can_refuse(State, Alpha, OldestKey, OldestValue, OldestTTL, OldetsTimestamp) ->
     FilteredState = filter_expired_values(State),
-    IsExpired = is_expired(TTL, Timestamp),
-    case maps:find(Key, FilteredState) of
+    IsExpired = is_expired(OldestTTL, OldetsTimestamp),
+    case maps:find(OldestKey, FilteredState) of
         {ok, {_, _, Timestamp}} ->
             if
                 OldestTimestamp > Timestamp ->
                     if
                         IsExpired ->
-                            maps:remove(Key, FilteredState);
+                            maps:remove(OldestKey, FilteredState);
                         true ->
-                            FilteredState#{Key => {OldestValue, OldestTTL, OldestTimestamp}}
+                            FilteredState#{OldestKey => {OldestValue, OldestTTL, OldestTimestamp}}
                     end;
                 true ->
                     FilteredState
@@ -205,7 +207,7 @@ is_this_an_offer_i_can_refuse(State, Alpha, OldestKey, OldestValue, OldestTTL, O
                 true ->
                     case maps:size(FilteredState) < Alpha of
                         true ->
-                            FilteredState#{Key => {OldestValue, OldestTTL, OldestTimestamp}};
+                            FilteredState#{OldestKey => {OldestValue, OldestTTL, OldestTimestamp}};
                         false ->
                             FilteredState
                     end
@@ -254,9 +256,9 @@ spread_get_handler(State, Key, SenderPid, ReferenceForSender) ->
 put_handler(State, Alpha, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids) ->
     case maps:find(Key, State) of 
         {ok, {_, _, _}} -> %pertenece, a priori tengo el espacio
-            put_and_spread()
+            put_and_spread(State, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids),
         error -> %no pertenece, veo de liberar espacio 
-            FreeSpace = Alpha - maps:size(State)
+            FreeSpace = Alpha - maps:size(State),
             case FreeSpace of
                 0 ->
                     filter_expired_or_deallocate_oldest(State, Alpha, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids)            
@@ -283,10 +285,10 @@ filterExpiredValues(State) ->
 
 filter_expired_or_deallocate_oldest(State, Alpha, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids) -> %ver argumentos
     FilteredState = filterExpiredValues(State),
-    FreeSpace = Alpha - maps:size(FilteredState)
+    FreeSpace = Alpha - maps:size(FilteredState),
     case FreeSpace of 
         0 -> 
-            deallocate_oldest_and_offer_to_other_replicas()
+            deallocate_oldest_and_offer_to_other_replicas(State, Alpha, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids)
         _ -> 
             put_and_spread(State, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids)
     end.
