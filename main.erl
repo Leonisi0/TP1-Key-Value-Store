@@ -7,18 +7,24 @@
 -spec delete(pid(), term()) -> ok.
 -spec get(pid(), term()) -> {ok, term()} | not_found.
 
-start_link(N) when N >= 0 -> 
-    star_superLink(N,true)
+start_link(N, Alpha) when N >= 0 -> 
+    start_superLink(N, true, Alpha).
 
-star_superLink(N,Primero) when N >= 0 -> 
-    case N of
-        0 -> [];
+start_superLink(N, Primero, Alpha) when N >= 0 -> 
+    ListaPids = case N of
+        0 -> 
+            [];
         _ ->
             Pid = spawn(fun init/0),    
-            ListaPids = start_superLink(N-1, Primero) ++ [Pid]
-    end
+            start_superLink(N-1, false, Alpha) ++ [Pid]
+    end,
     case Primero of 
-        true -> todosConTodos(ListaPids, length(ListaPids)).
+        true -> 
+            todosConTodos(ListaPids, length(ListaPids), Alpha),
+            {ok, ListaPids};
+        false ->
+            ListaPids
+    end.
 
 todosConTodos(ListaPids, ListaEnviar) ->
     case ListaEnviar of 
@@ -35,26 +41,29 @@ init() ->
             loop(#{}, Pids)
     end.
     
-loop(State, ListaPids) -> 
+loop(State, ListaPids, Alpha) -> 
     receive 
-        {put, Key, Value, TTL, SenderPid, ReferenceForSender} -> %FIXME: estamos devolviendo ok al que solicito?
-            NewState = put_handler(State, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids), 
-            loop(NewState, ListaPids);
-        {spread_put, Key, Value, TTL, Timestamp} -> %FIXME: estamos devolviendo ok al que solicito?
-            NewState = spread_put_handler(State, Key, Value, TTL, Timestamp),
-            loop(NewState, ListaPids);
+        {put, Key, Value, TTL, SenderPid, ReferenceForSender} -> 
+            NewState = put_handler(State, Alpha, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids), 
+            loop(NewState, ListaPids, Alpha);
+        {spread_put, Key, Value, TTL, Timestamp} -> 
+            NewState = spread_put_handler(State, Alpha, Key, Value, TTL, Timestamp),
+            loop(NewState, ListaPids, Alpha);
+        {offer_key, OldestKey, OldestValue, OldestTTL, OldetsTimestamp} -> 
+            NewState = is_this_an_offer_i_can_refuse(State, Alpha, OldestKey, OldestValue, OldestTTL, OldetsTimestamp),
+            loop(NewState, ListaPids, Alpha);
 
         {get, Key, SenderPid, ReferenceForSender} ->  
             get_handler(State, ListaPids, Key, SenderPid, ReferenceForSender),
-            loop(State, ListaPids);
+            loop(State, ListaPids, Alpha);
         {spread_get, Key, SenderPid, ReferenceForSender} ->
             spread_get_handler(State, Key, SenderPid, ReferenceForSender),
-            loop(State, ListaPids)
+            loop(State, ListaPids, Alpha)
          
         {delete, Key, SenderPid} -> 
             NewState = maps:remove(Key, State),
             SenderPid ! ok,
-            loop(NewState, ListaPids);
+            loop(NewState, ListaPids, Alpha);
         {stop, SenderPid} -> 
             SenderPid ! ok
     end.
@@ -126,8 +135,7 @@ get_newest_value_or_nothing(Iterator, NewestValue, SenderPid, MyRef, ReferenceFo
 newest_unexpired_between(NewestValue, Value, TTL, Timestamp) ->
     case NewestValue of 
         none ->
-            CurrentTime = erlang:system_time(millisecond),
-            IsExpired = (TTL =/= infinity) andalso ((Timestamp + TTL) =< CurrentTime),
+            IsExpired = is_expired(TTL, Timestamp),
             if 
                 IsExpired ->
                     none;
@@ -135,8 +143,7 @@ newest_unexpired_between(NewestValue, Value, TTL, Timestamp) ->
                     {Value, TTL, Timestamp}
             end;
         {_, _, NewestTimestamp} ->
-            CurrentTime = erlang:system_time(millisecond),
-            IsExpired = (TTL =/= infinity) andalso ((Timestamp + TTL) =< CurrentTime),
+            IsExpired = is_expired(TTL, Timestamp),
             if 
                 IsExpired ->
                     NewestValue;
@@ -149,14 +156,48 @@ newest_unexpired_between(NewestValue, Value, TTL, Timestamp) ->
                     end
             end
     end.
-            
+
+is_this_an_offer_i_can_refuse(State, Alpha, OldestKey, OldestValue, OldestTTL, OldetsTimestamp) ->
+    FilteredState = filter_expired_values(State),
+    IsExpired = is_expired(TTL, Timestamp),
+    case maps:find(Key, FilteredState) of
+        {ok, {_, _, Timestamp}} ->
+            if
+                OldestTimestamp > Timestamp ->
+                    if
+                        IsExpired ->
+                            maps:remove(Key, FilteredState);
+                        true ->
+                            FilteredState#{Key => {OldestValue, OldestTTL, OldestTimestamp}}
+                    end;
+                true ->
+                    FilteredState
+            end;
+        error ->
+            if
+                IsExpired ->
+                    FilteredState;
+                true ->
+                    case maps:size(FilteredState) < Alpha of
+                        true ->
+                            FilteredState#{Key => {OldestValue, OldestTTL, OldestTimestamp}};
+                        false ->
+                            FilteredState
+                    end
+            end
+    end.
+        
 %%%%%%%%%% HANDLERS %%%%%%%%%%
+
+
+is_expired(TTL, Timestamp) ->
+    CurrentTime = erlang:system_time(millisecond),
+    (TTL =/= infinity) andalso ((Timestamp + TTL) =< CurrentTime).
 
 get_handler(State, ListaPids, Key, SenderPid, ReferenceForSender) ->
     case maps:find(Key, State) of
         {ok, {Value, TTL, Timestamp}} ->
-            CurrentTime = erlang:system_time(millisecond),
-            IsExpired = (TTL =/= infinity) andalso ((Timestamp + TTL) =< CurrentTime),
+            IsExpired = is_expired(TTL, Timestamp),
             if 
                 IsExpired ->
                     fork_and_seek(ListaPids, Key, SenderPid, ReferenceForSender);
@@ -170,8 +211,7 @@ get_handler(State, ListaPids, Key, SenderPid, ReferenceForSender) ->
 spread_get_handler(State, Key, SenderPid, ReferenceForSender) ->
     case maps:find(Key, State) of 
         {ok, {Value, TTL, Timestamp}} ->
-            CurrentTime = erlang:system_time(millisecond),
-            IsExpired = (TTL =/= infinity) andalso ((Timestamp + TTL) =< CurrentTime),
+            IsExpired = is_expired(TTL, Timestamp),
             if 
                 IsExpired -> 
                     SenderPid ! {ReferenceForSender, not_found};
@@ -182,7 +222,21 @@ spread_get_handler(State, Key, SenderPid, ReferenceForSender) ->
             SenderPid ! {ReferenceForSender, not_found}
     end.
 
-put_handler(State, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids) ->
+put_handler(State, Alpha, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids) ->
+    case maps:find(Key, State) of 
+        {ok, {_, _, _}} -> %pertenece, a priori tengo el espacio
+            put_and_spread()
+        error -> %no pertenece, veo de liberar espacio 
+            FreeSpace = Alpha - maps:size(State)
+            case FreeSpace of
+                0 ->
+                    filter_expired_or_deallocate_oldest(State, Alpha, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids)            
+                _ -> 
+                    put_and_spread(State, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids)
+            end
+    end
+
+put_and_spread(State, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids) ->
     Timestamp = erlang:system_time(millisecond), %generamos el timestamp
     NewState = State#{Key => {Value, TTL, Timestamp}}, %guardamos la key en el nuevo estado
     SenderPid ! {ok, ReferenceForSender},
@@ -190,7 +244,48 @@ put_handler(State, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids) ->
     send_to_replicas(ListaPids, Message, self()), %paso la lista de pids a enviar, la entry y me envio a mi
     NewState. %retorno el nuevo estado
 
-spread_put_handler(State, Key, Value, TTL, Timestamp) ->
+filterExpiredValues(State) ->
+    maps:filter(
+        fun(_, {_, TTL, Timestamp}) ->
+            not is_expired(TTL, Timestamp)
+        end,
+        State
+    ).
+
+filter_expired_or_deallocate_oldest(State, Alpha, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids) -> %ver argumentos
+    FilteredState = filterExpiredValues(State),
+    FreeSpace = Alpha - maps:size(FilteredState)
+    case FreeSpace of 
+        0 -> 
+            deallocate_oldest_and_offer_to_other_replicas()
+        _ -> 
+            put_and_spread(State, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids)
+    end.
+
+deallocate_oldest_and_offer_to_other_replicas(State, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids) ->
+    Oldest = maps:fold(
+        fun(Key, {Value, TTL, Timestamp}, OldestSoFar) ->
+            case OldestSoFar of
+                none ->
+                    {Key, Value, TTL, Timestamp};
+                {_, _, _, OldTimestamp} when Timestamp < OldTimestamp ->
+                    {Key, Value, TTL, Timestamp};
+                _ ->
+                    OldestSoFar
+            end
+        end,
+        none,
+        State
+    )
+    {OldestKey, OldestValue, OldestTTL, OldetsTimestamp} = Oldest
+    spawn(fun() ->
+        Message = {offer_key, OldestKey, OldestValue, OldestTTL, OldetsTimestamp},
+        send_to_replicas(ListaPids, Message, self())
+    end),
+    StateWithFreeSpace = maps:remove(OldestKey, State),
+    put_and_spread(StateWithFreeSpace, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids).
+
+spread_put_handler(State, Alpha, Key, Value, TTL, Timestamp) ->
     case maps:find(Key, State) of
         {ok, {_, _, MyTimestamp}} -> %existe esa key en mis libros, reviso cual es mas nueva
             CurrentTime = erlang:system_time(millisecond),
