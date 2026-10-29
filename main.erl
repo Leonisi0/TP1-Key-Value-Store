@@ -49,12 +49,15 @@ loop(State, ListaPids) ->
             loop(State, ListaPids);
         {spread_get, Key, SenderPid, ReferenceForSender} ->
             spread_get_handler(State, Key, SenderPid, ReferenceForSender),
-            loop(State, ListaPids)
+            loop(State, ListaPids);
          
-        {delete, Key, SenderPid} -> 
-            NewState = maps:remove(Key, State),
-            SenderPid ! ok,
+        {delete, Key, SenderPid, ReferenceForSender} -> 
+            NewState = delete_handler(State, Key, SenderPid, ReferenceForSender, ListaPids),
             loop(NewState, ListaPids);
+        {spread_delete, Key, Timestamp} -> 
+            NewState = spread_delete_handler(State, Key, Timestamp),
+            loop(NewState, ListaPids);
+
         {stop, SenderPid} -> 
             SenderPid ! ok
     end.
@@ -77,7 +80,13 @@ get(Pid, Key) ->
     end.                                   
 
 delete(Pid, Key) -> 
-    Pid ! {delete, Key, self()}.
+    Ref = make_ref(),
+    Pid ! {delete, Key, self(), Ref},
+    receive
+        {ok, Ref} -> 
+            ok
+    end.
+
 
 %%%%%%%%%% FUNCIONES AUXILIARES %%%%%%%%%%
 
@@ -110,6 +119,8 @@ get_newest_value_or_nothing(Iterator, NewestValue, SenderPid, MyRef, ReferenceFo
             case NewestValue of
                 none ->
                     SenderPid ! {ReferenceForSender, not_found};
+                {deleted,_,_} -> 
+                    SenderPid ! {ReferenceForSender, not_found};
                 {Value, _, _} ->
                     SenderPid ! {ReferenceForSender, {ok, Value}}
             end;
@@ -122,6 +133,19 @@ get_newest_value_or_nothing(Iterator, NewestValue, SenderPid, MyRef, ReferenceFo
                     get_newest_value_or_nothing(Iterator-1, NewestValue, SenderPid, MyRef, ReferenceForSender)
             end
     end.
+
+newest_unexpired_between(NewestValue, deleted, TTL, Timestamp) ->
+    case NewestValue of
+        none ->
+            {deleted, TTL, Timestamp};
+        {_, _, NewestTimestamp} ->
+            if
+                Timestamp > NewestTimestamp ->
+                    {deleted, TTL, Timestamp};
+                true ->
+                    NewestValue
+            end
+    end;
 
 newest_unexpired_between(NewestValue, Value, TTL, Timestamp) ->
     case NewestValue of 
@@ -154,6 +178,8 @@ newest_unexpired_between(NewestValue, Value, TTL, Timestamp) ->
 
 get_handler(State, ListaPids, Key, SenderPid, ReferenceForSender) ->
     case maps:find(Key, State) of
+        {ok, {deleted, _, _}} ->
+            SenderPid ! {ReferenceForSender, not_found};
         {ok, {Value, TTL, Timestamp}} ->
             CurrentTime = erlang:system_time(millisecond),
             IsExpired = (TTL =/= infinity) andalso ((Timestamp + TTL) =< CurrentTime),
@@ -169,6 +195,8 @@ get_handler(State, ListaPids, Key, SenderPid, ReferenceForSender) ->
 
 spread_get_handler(State, Key, SenderPid, ReferenceForSender) ->
     case maps:find(Key, State) of 
+        {ok, {deleted, TTL, Timestamp}} ->
+            SenderPid ! {ReferenceForSender, deleted, TTL, Timestamp};
         {ok, {Value, TTL, Timestamp}} ->
             CurrentTime = erlang:system_time(millisecond),
             IsExpired = (TTL =/= infinity) andalso ((Timestamp + TTL) =< CurrentTime),
@@ -216,4 +244,27 @@ spread_put_handler(State, Key, Value, TTL, Timestamp) ->
                     State
             end
     end.
+
+delete_handler(State, Key, SenderPid, ReferenceForSender, ListaPids) -> 
+    Now = erlang:system_time(millisecond),
+    NewState = State#{Key => {deleted, infinity, Now}},
+    SenderPid ! {ok, ReferenceForSender},
+    send_to_replicas(ListaPids, {spread_delete, Key, Now}, self()),
+    NewState.
+
+spread_delete_handler(State, Key, DeleteTimestamp) ->
+    case maps:find(Key, State) of
+        {ok, {_, _, LocalTimestamp}} ->
+            if 
+                DeleteTimestamp >= LocalTimestamp ->
+                    State#{Key => {deleted, infinity, DeleteTimestamp}};
+                true ->
+                    State 
+            end;
+        error ->
+            State#{Key => {deleted, infinity, DeleteTimestamp}}
+    end.
+
+
+
 
