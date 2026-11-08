@@ -19,3 +19,7 @@ shell:
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+test:
+	erlc main.erl main_tests.erl
+	erl -noshell -eval "eunit:test(main_tests, [verbose]), init:stop()."
