@@ -312,10 +312,8 @@ deallocate_oldest_and_offer_to_other_replicas(State, _Alpha, Key, Value, TTL, Se
         State
     ),
     {OldestKey, OldestValue, OldestTTL, OldestTimestamp} = Oldest,
-    spawn(fun() ->
-        Message = {offer_key, OldestKey, OldestValue, OldestTTL, OldestTimestamp},
-        send_to_replicas(ListaPids, Message, self())
-    end),
+    Message = {offer_key, OldestKey, OldestValue, OldestTTL, OldestTimestamp},
+    send_to_replicas(ListaPids, Message, self()),
     StateWithFreeSpace = maps:remove(OldestKey, State),
     put_and_spread(StateWithFreeSpace, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids).
 
