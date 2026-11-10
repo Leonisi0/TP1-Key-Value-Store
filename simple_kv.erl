@@ -1,4 +1,4 @@
--module(main).
+-module(simple_kv).
 -export([start_link/2, stop/1, put/3, put/4, delete/2, get/2]).
 -spec start_link(pos_integer(), pos_integer()) -> {ok, [pid()]}.
 -spec stop([pid()]) -> ok.
@@ -51,7 +51,7 @@ loop(State, ListaPids, Alpha) ->
             NewState = put_handler(State, Alpha, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids), 
             loop(NewState, ListaPids, Alpha);
         {spread_put, Key, Value, TTL, Timestamp} -> 
-            NewState = spread_put_handler(State, Alpha, Key, Value, TTL, Timestamp),
+            NewState = spread_put_handler(State, Alpha, Key, Value, TTL, Timestamp, ListaPids),
             loop(NewState, ListaPids, Alpha);
         {offer_key, OldestKey, OldestValue, OldestTTL, OldestTimestamp} -> 
             NewState = is_this_an_offer_i_can_refuse(State, Alpha, OldestKey, OldestValue, OldestTTL, OldestTimestamp),
@@ -293,16 +293,24 @@ filter_expired_or_deallocate_oldest(State, Alpha, Key, Value, TTL, SenderPid, Re
         0 -> 
             deallocate_oldest_and_offer_to_other_replicas(State, Alpha, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids);
         _ -> 
-            put_and_spread(State, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids)
+            put_and_spread(State, Key, Value, TTL, SenderPid, ReferenceForSender, FilteredState)
     end.
 
 deallocate_oldest_and_offer_to_other_replicas(State, _Alpha, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids) ->
-    Oldest = maps:fold(
+    Oldest = findOldest(State),
+    {OldestKey, OldestValue, OldestTTL, OldestTimestamp} = Oldest,
+    Message = {offer_key, OldestKey, OldestValue, OldestTTL, OldestTimestamp},
+    send_to_replicas(ListaPids, Message, self()),
+    StateWithFreeSpace = maps:remove(OldestKey, State),
+    put_and_spread(StateWithFreeSpace, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids).
+
+findOldest(State) ->
+    maps:fold(
         fun(K, {V, T, Ts}, OldestSoFar) ->
             case OldestSoFar of
                 none ->
                     {K, V, T, Ts};
-                {_, _, _, OldTimestamp} when Ts < OldTimestamp ->
+                {_, _, _, OldTs} when Ts < OldTs ->
                     {K, V, T, Ts};
                 _ ->
                     OldestSoFar
@@ -310,18 +318,13 @@ deallocate_oldest_and_offer_to_other_replicas(State, _Alpha, Key, Value, TTL, Se
         end,
         none,
         State
-    ),
-    {OldestKey, OldestValue, OldestTTL, OldestTimestamp} = Oldest,
-    Message = {offer_key, OldestKey, OldestValue, OldestTTL, OldestTimestamp},
-    send_to_replicas(ListaPids, Message, self()),
-    StateWithFreeSpace = maps:remove(OldestKey, State),
-    put_and_spread(StateWithFreeSpace, Key, Value, TTL, SenderPid, ReferenceForSender, ListaPids).
+    ).
 
-spread_put_handler(State, _Alpha, Key, Value, TTL, Timestamp) ->
+spread_put_handler(State, Alpha, Key, Value, TTL, Timestamp, ListaPids) ->
     case maps:find(Key, State) of
         {ok, {MyValue, _, MyTimestamp}} -> 
             CurrentTime = erlang:system_time(millisecond),
-            %% Desempate determinista si los timestamps son iguales:
+            %% desempate determinista si los timestamps son iguales:
             IsStrictlyNewer = (Timestamp > MyTimestamp) orelse 
                               ((Timestamp == MyTimestamp) andalso (Value > MyValue)),
             IsUnexpired = if 
@@ -338,10 +341,24 @@ spread_put_handler(State, _Alpha, Key, Value, TTL, Timestamp) ->
             CurrentTime = erlang:system_time(millisecond),
             IsExpired = (TTL =/= infinity) andalso ((Timestamp + TTL) =< CurrentTime),
             if 
-                IsExpired =:= false ->
-                    State#{Key => {Value, TTL, Timestamp}};
+                IsExpired ->
+                    State;
                 true ->
-                    State
+                    try_to_insert(State, Alpha, Key, Value, TTL, Timestamp, ListaPids)
+            end
+    end.
+
+try_to_insert(State, Alpha, Key, Value, TTL, Timestamp, _ListaPids) ->
+    case maps:size(State) < Alpha of
+        true ->
+            State#{Key => {Value, TTL, Timestamp}};
+        false ->
+            FilteredState = filterExpiredValues(State),
+            case maps:size(FilteredState) < Alpha of
+                true ->
+                    FilteredState#{Key => {Value, TTL, Timestamp}};
+                false ->
+                    FilteredState
             end
     end.
 
